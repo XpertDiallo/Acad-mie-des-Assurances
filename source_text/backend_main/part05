@@ -1,0 +1,122 @@
+    completed_lessons = db.scalar(select(func.count(Progress.id)).where(Progress.user_id == user.id, Progress.lesson_id.in_(lesson_ids), Progress.completed.is_(True))) or 0
+    all_lessons_completed = completed_lessons >= len(lesson_ids)
+    attempt = ExamAttempt(user_id=user.id, module_id=module.id, score=score, passed=passed, answers_json=json.dumps(payload.answers))
+    db.add(attempt)
+    certificate = None
+    if passed and all_lessons_completed:
+        certificate = ensure_certificate(db, user, module, score)
+    audit(db, user.id, "exam.submit", f"module:{module.slug}", {"score": score, "passed": passed})
+    db.commit()
+    return {
+        "score": score, "passed": passed, "pass_score": 70, "all_lessons_completed": all_lessons_completed,
+        "certificate": {"id": certificate.id, "number": certificate.number, "verification_code": certificate.verification_code} if certificate else None,
+        "message": "Félicitations, votre attestation est disponible." if certificate else ("Examen réussi. Terminez toutes les leçons pour obtenir l’attestation." if passed else "Le seuil de 70/100 n’est pas atteint. Révisez les leçons puis recommencez."),
+    }
+
+
+@app.post(f"{API_PREFIX}/tutor/ask")
+async def tutor_ask(payload: TutorIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    module = db.scalar(select(CourseModule).where(CourseModule.slug == payload.module_slug))
+    if not module:
+        raise HTTPException(status_code=404, detail="Module introuvable")
+    if not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Accès non activé")
+    sources = course_index.retrieve(module, payload.question, payload.lesson_id, top_k=5)
+    answer = await groq_answer(payload.question, payload.mode, module, sources)
+    if not answer:
+        answer = local_answer(payload.question, payload.mode, sources)
+    db.add(ChatLog(user_id=user.id, module_id=module.id, question=payload.question, answer=answer))
+    db.commit()
+    return {
+        "answer": answer,
+        "sources": [{"lesson_id": s["lesson_id"], "lesson_title": s["lesson_title"], "excerpt": s["chunk"][:360], "score": s["score"]} for s in sources[:4]],
+    }
+
+
+@app.post(f"{API_PREFIX}/tutor/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    language: str = Form(default="fr"),
+    user: User = Depends(current_user),
+) -> dict[str, Any]:
+    del user
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="La transcription serveur n’est pas configurée. Utilisez la saisie vocale du navigateur.")
+    content = await file.read()
+    if len(content) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Fichier audio trop volumineux")
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            data={"model": GROQ_STT_MODEL, "language": language, "response_format": "json"},
+            files={"file": (file.filename or "question.webm", content, file.content_type or "audio/webm")},
+        )
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail="Transcription indisponible pour le moment")
+    return {"text": response.json().get("text", "")}
+
+
+@app.get(f"{API_PREFIX}/certificates")
+def certificates(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    rows = list(db.scalars(select(Certificate).where(Certificate.user_id == user.id).order_by(Certificate.issued_at.desc())))
+    result = []
+    for cert in rows:
+        module = db.get(CourseModule, cert.module_id)
+        result.append({"id": cert.id, "number": cert.number, "module_title": module.title if module else "Module", "score": cert.score, "issued_at": cert.issued_at, "verification_code": cert.verification_code, "revoked": cert.revoked})
+    return result
+
+
+def certificate_pdf(cert: Certificate, user: User, module: CourseModule) -> bytes:
+    buffer = io.BytesIO()
+    page = landscape(A4)
+    c = canvas.Canvas(buffer, pagesize=page)
+    width, height = page
+    navy = colors.HexColor("#123B5D")
+    green = colors.HexColor("#0E8F75")
+    gold = colors.HexColor("#D9A441")
+    c.setFillColor(colors.HexColor("#F7FAFC")); c.rect(0, 0, width, height, fill=1, stroke=0)
+    c.setStrokeColor(navy); c.setLineWidth(5); c.rect(1.2*cm, 1.2*cm, width-2.4*cm, height-2.4*cm, fill=0, stroke=1)
+    c.setStrokeColor(gold); c.setLineWidth(1.5); c.rect(1.7*cm, 1.7*cm, width-3.4*cm, height-3.4*cm, fill=0, stroke=1)
+    c.setFillColor(navy); c.setFont("Helvetica-Bold", 25); c.drawCentredString(width/2, height-3.0*cm, "ACADÉMIE DES ASSURANCES")
+    c.setFillColor(green); c.setFont("Helvetica-Bold", 20); c.drawCentredString(width/2, height-4.4*cm, "ATTESTATION DE RÉUSSITE")
+    c.setFillColor(colors.HexColor("#334155")); c.setFont("Helvetica", 12); c.drawCentredString(width/2, height-5.6*cm, "Il est attesté que")
+    c.setFillColor(navy); c.setFont("Helvetica-Bold", 24); c.drawCentredString(width/2, height-7.0*cm, f"{user.first_name} {user.last_name}")
+    styles = getSampleStyleSheet()
+    style = ParagraphStyle("center", parent=styles["Normal"], alignment=TA_CENTER, fontName="Helvetica", fontSize=13, leading=19, textColor=colors.HexColor("#334155"))
+    p = Paragraph(f"a suivi avec succès le module <b>{module.title}</b><br/>et obtenu la note de <b>{cert.score:.0f}/100</b>.", style)
+    pw, ph = p.wrap(width-10*cm, 3*cm); p.drawOn(c, (width-pw)/2, height-10.2*cm)
+    verify_url = f"{PUBLIC_APP_URL.rstrip('/')}/verify/{cert.verification_code}"
+    qr = qrcode.make(verify_url)
+    qr_buffer = io.BytesIO(); qr.save(qr_buffer, format="PNG"); qr_buffer.seek(0)
+    from reportlab.lib.utils import ImageReader
+    c.drawImage(ImageReader(qr_buffer), width-5.1*cm, 2.4*cm, 2.2*cm, 2.2*cm, preserveAspectRatio=True, mask="auto")
+    c.setFillColor(colors.HexColor("#475569")); c.setFont("Helvetica", 9)
+    c.drawString(2.7*cm, 3.8*cm, f"N° {cert.number}")
+    c.drawString(2.7*cm, 3.25*cm, f"Délivrée le {cert.issued_at.strftime('%d/%m/%Y')}")
+    c.drawString(2.7*cm, 2.7*cm, "Certificat privé de fin de formation")
+    c.setFont("Helvetica-Bold", 10); c.drawCentredString(width/2, 3.1*cm, "Hussein Brahima DIALLO")
+    c.setFont("Helvetica", 9); c.drawCentredString(width/2, 2.65*cm, "Directeur Général")
+    c.setFont("Helvetica", 8); c.drawRightString(width-2.7*cm, 2.15*cm, "Scannez le code pour vérifier l’authenticité")
+    c.showPage(); c.save(); buffer.seek(0)
+    return buffer.read()
+
+
+@app.get(f"{API_PREFIX}/certificates/{{certificate_id}}/download")
+def download_certificate(certificate_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)) -> StreamingResponse:
+    cert = db.get(Certificate, certificate_id)
+    if not cert or (cert.user_id != user.id and user.role != "admin"):
+        raise HTTPException(status_code=404, detail="Attestation introuvable")
+    module = db.get(CourseModule, cert.module_id)
+    owner = db.get(User, cert.user_id)
+    if not module or not owner:
+        raise HTTPException(status_code=404, detail="Données incomplètes")
+    pdf = certificate_pdf(cert, owner, module)
+    return StreamingResponse(io.BytesIO(pdf), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{cert.number}.pdf"'})
+
+
+@app.get(f"{API_PREFIX}/verify/{{code}}")
+def verify_certificate(code: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    cert = db.scalar(select(Certificate).where(Certificate.verification_code == code))
+    if not cert:
+        return {"valid": False, "message": "Aucune attestation ne correspond à ce code."}
