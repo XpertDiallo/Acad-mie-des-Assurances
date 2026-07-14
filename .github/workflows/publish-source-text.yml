@@ -1,0 +1,51 @@
+name: Publication du code source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - source_text/READY
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assembler les fichiers principaux
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p backend/app/data frontend/src
+          cat source_text/backend_main/part* > backend/app/main.py
+          cat source_text/app_tsx/part* > frontend/src/App.tsx
+          cat source_text/styles_css/part* > frontend/src/styles.css
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          files = sorted(Path('source_text/modules').glob('module_*.json'))
+          modules = [json.loads(path.read_text(encoding='utf-8')) for path in files]
+          Path('backend/app/data/modules.json').write_text(
+              json.dumps(modules, ensure_ascii=False, indent=2) + '\n',
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Nettoyer et publier
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf source_text source_bundle
+          rm -f .github/workflows/bootstrap-source.yml
+          rm -f .github/workflows/publish-source-text.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publier le MVP complet de l’Académie des Assurances"
+          git push origin main
