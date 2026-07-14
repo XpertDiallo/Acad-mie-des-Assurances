@@ -1,0 +1,134 @@
+def get_module(slug: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    module = db.scalar(select(CourseModule).where(CourseModule.slug == slug))
+    if not module or (not module.published and user.role == "student"):
+        raise HTTPException(status_code=404, detail="Module introuvable")
+    return serialize_module(db, module, user, include_lessons=True)
+
+
+@app.get(f"{API_PREFIX}/lessons/{{lesson_id}}")
+def get_lesson(lesson_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    lesson = db.get(Lesson, lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Leçon introuvable")
+    module = db.get(CourseModule, lesson.module_id)
+    if not module or not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Ce module nécessite une activation")
+    progress = db.scalar(select(Progress).where(Progress.user_id == user.id, Progress.lesson_id == lesson.id))
+    return {
+        "id": lesson.id, "module_slug": module.slug, "module_title": module.title, "order": lesson.order,
+        "title": lesson.title, "summary": lesson.summary, "content": lesson.content,
+        "estimated_minutes": lesson.estimated_minutes,
+        "progress": {"segment_index": progress.segment_index, "segment_count": progress.segment_count, "completed": progress.completed, "quiz_score": progress.quiz_score} if progress else None,
+    }
+
+
+@app.put(f"{API_PREFIX}/progress/{{lesson_id}}")
+def save_progress(lesson_id: str, payload: ProgressIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    lesson = db.get(Lesson, lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Leçon introuvable")
+    module = db.get(CourseModule, lesson.module_id)
+    if not module or not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Accès non activé")
+    row = db.scalar(select(Progress).where(Progress.user_id == user.id, Progress.lesson_id == lesson_id))
+    if not row:
+        row = Progress(user_id=user.id, lesson_id=lesson_id)
+        db.add(row)
+    row.segment_count = max(1, payload.segment_count)
+    row.segment_index = max(0, min(payload.segment_index, row.segment_count - 1))
+    row.completed = payload.completed or row.completed
+    row.last_seen = datetime.now(timezone.utc)
+    db.commit()
+    return {"saved": True, "module_progress": module_progress(db, user.id, module)}
+
+
+@app.get(f"{API_PREFIX}/lessons/{{lesson_id}}/quiz")
+def lesson_quiz(lesson_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    lesson = db.get(Lesson, lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Leçon introuvable")
+    module = db.get(CourseModule, lesson.module_id)
+    if not module or not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Accès non activé")
+    questions = list(db.scalars(select(Question).where(Question.lesson_id == lesson_id, Question.active.is_(True)).order_by(Question.id)))
+    return {"lesson_id": lesson_id, "questions": [{"id": q.id, "prompt": q.prompt, "options": json.loads(q.options_json), "difficulty": q.difficulty} for q in questions]}
+
+
+@app.post(f"{API_PREFIX}/quizzes/submit")
+def submit_quiz(payload: QuizSubmission, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    lesson = db.get(Lesson, payload.lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Leçon introuvable")
+    module = db.get(CourseModule, lesson.module_id)
+    if not module or not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Accès non activé")
+    questions = list(db.scalars(select(Question).where(Question.lesson_id == lesson.id, Question.active.is_(True))))
+    if not questions:
+        raise HTTPException(status_code=400, detail="Aucune question disponible")
+    details = []
+    correct = 0
+    for q in questions:
+        selected = payload.answers.get(q.id)
+        ok = selected == q.correct_index
+        correct += int(ok)
+        details.append({"id": q.id, "selected": selected, "correct_index": q.correct_index, "is_correct": ok, "explanation": q.explanation, "options": json.loads(q.options_json)})
+    score = round(100 * correct / len(questions), 2)
+    progress = db.scalar(select(Progress).where(Progress.user_id == user.id, Progress.lesson_id == lesson.id))
+    if not progress:
+        progress = Progress(user_id=user.id, lesson_id=lesson.id, completed=True)
+        db.add(progress)
+    progress.quiz_score = score
+    progress.completed = True
+    progress.last_seen = datetime.now(timezone.utc)
+    db.commit()
+    return {"score": score, "correct": correct, "total": len(questions), "details": details, "module_progress": module_progress(db, user.id, module)}
+
+
+@app.get(f"{API_PREFIX}/modules/{{slug}}/exam")
+def get_exam(slug: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    module = db.scalar(select(CourseModule).where(CourseModule.slug == slug))
+    if not module:
+        raise HTTPException(status_code=404, detail="Module introuvable")
+    if not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Accès non activé")
+    lesson_ids = [lesson.id for lesson in module.lessons]
+    questions = list(db.scalars(select(Question).where(Question.lesson_id.in_(lesson_ids), Question.active.is_(True)).order_by(Question.id)))
+    selected = questions[: min(10, len(questions))]
+    return {
+        "module_slug": slug, "pass_score": 70, "duration_minutes": 30,
+        "questions": [{"id": q.id, "prompt": q.prompt, "options": json.loads(q.options_json), "difficulty": q.difficulty} for q in selected],
+    }
+
+
+def ensure_certificate(db: Session, user: User, module: CourseModule, score: float) -> Certificate:
+    cert = db.scalar(select(Certificate).where(Certificate.user_id == user.id, Certificate.module_id == module.id, Certificate.revoked.is_(False)))
+    if cert:
+        if score > cert.score:
+            cert.score = score
+        return cert
+    year = datetime.now(timezone.utc).year
+    count = db.scalar(select(func.count(Certificate.id)).where(func.strftime("%Y", Certificate.issued_at) == str(year))) if DATABASE_URL.startswith("sqlite") else db.scalar(select(func.count(Certificate.id)))
+    sequence = int(count or 0) + 1
+    cert = Certificate(
+        user_id=user.id, module_id=module.id, score=score,
+        number=f"AA-CIMA-{year}-{module.code}-{sequence:06d}",
+        verification_code=secrets.token_urlsafe(24),
+    )
+    db.add(cert)
+    return cert
+
+
+@app.post(f"{API_PREFIX}/modules/{{slug}}/exam/submit")
+def submit_exam(slug: str, payload: ExamSubmission, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    module = db.scalar(select(CourseModule).where(CourseModule.slug == slug))
+    if not module:
+        raise HTTPException(status_code=404, detail="Module introuvable")
+    if not has_module_access(db, user, module):
+        raise HTTPException(status_code=403, detail="Accès non activé")
+    lesson_ids = [lesson.id for lesson in module.lessons]
+    questions = list(db.scalars(select(Question).where(Question.lesson_id.in_(lesson_ids), Question.active.is_(True)).order_by(Question.id)))[:10]
+    if not questions:
+        raise HTTPException(status_code=400, detail="Examen indisponible")
+    correct = sum(1 for q in questions if payload.answers.get(q.id) == q.correct_index)
+    score = round(100 * correct / len(questions), 2)
+    passed = score >= 70
