@@ -1,0 +1,151 @@
+    if not lesson_ids:
+        return {"percent": 0, "completed": 0, "total": 0, "last_lesson_id": None, "last_segment_index": 0}
+    rows = list(db.scalars(select(Progress).where(Progress.user_id == user_id, Progress.lesson_id.in_(lesson_ids))))
+    completed = sum(1 for row in rows if row.completed)
+    last = max(rows, key=lambda row: row.last_seen.replace(tzinfo=timezone.utc) if row.last_seen.tzinfo is None else row.last_seen, default=None)
+    return {
+        "percent": round(100 * completed / len(lesson_ids)),
+        "completed": completed,
+        "total": len(lesson_ids),
+        "last_lesson_id": last.lesson_id if last else lesson_ids[0],
+        "last_segment_index": last.segment_index if last else 0,
+    }
+
+
+def serialize_module(db: Session, module: CourseModule, user: User | None = None, include_lessons: bool = False) -> dict[str, Any]:
+    access = bool(user and has_module_access(db, user, module))
+    payload = {
+        "id": module.id,
+        "slug": module.slug,
+        "code": module.code,
+        "title": module.title,
+        "description": module.description,
+        "is_free": module.is_free,
+        "price_fcfa": module.price_fcfa,
+        "duration_label": module.duration_label,
+        "level": module.level,
+        "published": module.published,
+        "version": module.version,
+        "lesson_count": len(module.lessons),
+        "has_access": access,
+        "progress": module_progress(db, user.id, module) if user else None,
+    }
+    if include_lessons:
+        payload["lessons"] = [
+            {
+                "id": lesson.id,
+                "order": lesson.order,
+                "title": lesson.title,
+                "summary": lesson.summary,
+                "estimated_minutes": lesson.estimated_minutes,
+                "progress": next((
+                    {"segment_index": p.segment_index, "segment_count": p.segment_count, "completed": p.completed, "quiz_score": p.quiz_score}
+                    for p in db.scalars(select(Progress).where(Progress.user_id == user.id, Progress.lesson_id == lesson.id))
+                ), None) if user else None,
+            }
+            for lesson in module.lessons
+        ]
+    return payload
+
+
+class CourseIndex:
+    def __init__(self) -> None:
+        self.cache: dict[int, dict[str, Any]] = {}
+        self.semantic_model: Any | None = None
+
+    @staticmethod
+    def chunk_text(text: str, max_chars: int = 900) -> list[str]:
+        paragraphs = [p.strip() for p in text.split("\n") if len(p.strip()) > 25]
+        chunks: list[str] = []
+        current = ""
+        for paragraph in paragraphs:
+            if current and len(current) + len(paragraph) + 1 > max_chars:
+                chunks.append(current)
+                current = paragraph
+            else:
+                current = f"{current}\n{paragraph}".strip()
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def build(self, module: CourseModule) -> dict[str, Any]:
+        entries: list[dict[str, str]] = []
+        for lesson in module.lessons:
+            for idx, chunk in enumerate(self.chunk_text(lesson.content)):
+                entries.append({"lesson_id": lesson.id, "lesson_title": lesson.title, "chunk": chunk, "chunk_id": f"{lesson.id}-{idx+1}"})
+        corpus = [entry["chunk"] for entry in entries] or [module.description]
+        if EMBEDDING_PROVIDER in {"semantic", "sentence-transformers", "sentence_transformers"}:
+            try:
+                from sentence_transformers import SentenceTransformer
+                if self.semantic_model is None:
+                    self.semantic_model = SentenceTransformer(SEMANTIC_MODEL)
+                matrix = self.semantic_model.encode(corpus, normalize_embeddings=True, show_progress_bar=False)
+                result = {"version": module.version, "entries": entries, "kind": "semantic", "matrix": np.asarray(matrix)}
+                self.cache[module.id] = result
+                return result
+            except Exception:
+                # The application remains fully usable when the optional model is unavailable.
+                pass
+        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=1, max_features=45000, sublinear_tf=True)
+        matrix = vectorizer.fit_transform(corpus)
+        result = {"version": module.version, "entries": entries, "kind": "tfidf", "vectorizer": vectorizer, "matrix": matrix}
+        self.cache[module.id] = result
+        return result
+
+    def retrieve(self, module: CourseModule, query: str, lesson_id: str | None = None, top_k: int = 5) -> list[dict[str, Any]]:
+        index = self.cache.get(module.id)
+        if not index or index["version"] != module.version:
+            index = self.build(module)
+        if index.get("kind") == "semantic" and self.semantic_model is not None:
+            qv = self.semantic_model.encode([query], normalize_embeddings=True, show_progress_bar=False)
+            scores = np.asarray(qv)[0] @ np.asarray(index["matrix"]).T
+        else:
+            qv = index["vectorizer"].transform([query])
+            scores = cosine_similarity(qv, index["matrix"])[0]
+        order = np.argsort(scores)[::-1]
+        results: list[dict[str, Any]] = []
+        for idx in order:
+            entry = index["entries"][int(idx)]
+            if lesson_id and entry["lesson_id"] != lesson_id and len(results) < 2:
+                continue
+            score = float(scores[int(idx)])
+            if score <= 0 and results:
+                continue
+            results.append({**entry, "score": round(score, 4)})
+            if len(results) >= top_k:
+                break
+        if not results and index["entries"]:
+            results = [{**index["entries"][0], "score": 0.0}]
+        return results
+
+
+course_index = CourseIndex()
+
+
+async def groq_answer(question: str, mode: str, module: CourseModule, sources: list[dict[str, Any]]) -> str | None:
+    if not GROQ_API_KEY:
+        return None
+    context = "\n\n".join(f"[Source {i+1} — {s['lesson_title']}]\n{s['chunk']}" for i, s in enumerate(sources))
+    mode_instruction = {
+        "clarification": "Explique clairement la notion demandée.",
+        "simple": "Explique avec des mots très simples et des phrases courtes.",
+        "example": "Donne un exemple professionnel concret en zone CIMA, sans inventer de règle.",
+        "numeric": "Donne un exemple chiffré simple en FCFA quand les sources le permettent.",
+        "trap": "Signale les confusions, erreurs fréquentes et pièges d’examen.",
+        "summary": "Résume les idées essentielles sous forme de court rappel structuré.",
+    }.get(mode, "Réponds de façon pédagogique.")
+    system = (
+        "Tu es le tuteur pédagogique de l’Académie des Assurances. Réponds uniquement à partir des sources fournies. "
+        "N’invente ni article, ni seuil, ni obligation. Si les sources ne suffisent pas, indique-le explicitement. "
+        "Réponds en français accessible, avec un exemple si utile. Termine par une rubrique 'Sources du cours' citant les numéros de sources. "
+        "Ne parle jamais de ton fonctionnement technique."
+    )
+    prompt = f"Module : {module.title}\nConsigne : {mode_instruction}\nQuestion : {question}\n\nSources :\n{context}"
+    for model in (GROQ_MODEL_PRIMARY, GROQ_MODEL_FALLBACK, GROQ_MODEL_FAST):
+        try:
+            async with httpx.AsyncClient(timeout=35) as client:
+                response = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+                    json={
+                        "model": model,
