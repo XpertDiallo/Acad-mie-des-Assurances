@@ -1,0 +1,12 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+sqlalchemy==2.0.41
+pydantic[email]==2.11.7
+bcrypt==4.3.0
+PyJWT==2.10.1
+httpx==0.28.1
+python-multipart==0.0.20
+scikit-learn==1.7.0
+numpy==2.3.1
+reportlab==4.4.2
+qrcode[pil]==8.2
