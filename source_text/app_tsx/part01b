@@ -1,0 +1,34 @@
+      <Link to="/" className="brand brand-light"><span className="brand-mark">AA</span><span>Académie des Assurances</span></Link>
+      <div><span className="eyebrow light">Votre salle de classe numérique</span><h1>Apprendre.<br/>Comprendre.<br/><em>Réussir.</em></h1><p>Progressez dans les métiers de l’assurance avec une méthode interactive et structurée.</p></div>
+      <div className="auth-quote"><Volume2/><span>« Arrêtez la lecture, posez une question, puis reprenez exactement où vous vous êtes arrêté. »</span></div>
+    </div>
+    <div className="auth-panel">
+      <div className="auth-card">
+        <Link to="/" className="mobile-brand brand"><span className="brand-mark">AA</span><span>Académie des Assurances</span></Link>
+        <span className="eyebrow">{mode === 'login' ? 'Bon retour parmi nous' : 'Créez votre espace'}</span>
+        <h2>{mode === 'login' ? 'Connexion' : 'Inscription gratuite'}</h2>
+        <p>{mode === 'login' ? 'Retrouvez votre progression et poursuivez votre formation.' : 'Le module « Les fondements de l’assurance » est accessible gratuitement.'}</p>
+        <ErrorBox message={error}/>
+        <form onSubmit={submit}>
+          {mode === 'register' && <div className="form-row"><label>Prénom<input required value={form.first_name} onChange={e => setForm({...form, first_name:e.target.value})}/></label><label>Nom<input required value={form.last_name} onChange={e => setForm({...form, last_name:e.target.value})}/></label></div>}
+          <label>Adresse email<input type="email" required value={form.email} onChange={e => setForm({...form, email:e.target.value})} placeholder="nom@exemple.com"/></label>
+          {mode === 'register' && <><div className="form-row"><label>Téléphone<input value={form.phone} onChange={e => setForm({...form, phone:e.target.value})}/></label><label>Pays<input value={form.country} onChange={e => setForm({...form, country:e.target.value})}/></label></div><label>Profession ou fonction<input value={form.profession} onChange={e => setForm({...form, profession:e.target.value})}/></label></>}
+          <label>Mot de passe<input type="password" required minLength={8} value={form.password} onChange={e => setForm({...form, password:e.target.value})}/></label>
+          <button disabled={busy} className="btn btn-primary full" type="submit">{busy ? 'Patientez...' : mode === 'login' ? 'Se connecter' : 'Créer mon compte'}</button>
+        </form>
+        {mode === 'login' && <div className="demo-block"><div className="divider"><span>Accès de démonstration</span></div>{demos.map(d => <button disabled={busy} onClick={() => demo(d.email,d.password)} className="demo-login" key={d.email}>{d.icon}<span><strong>{d.label}</strong><small>{d.email}</small></span><ChevronRight/></button>)}</div>}
+        <p className="auth-switch">{mode === 'login' ? <>Pas encore de compte ? <Link to="/register">S’inscrire</Link></> : <>Déjà inscrit ? <Link to="/login">Se connecter</Link></>}</p>
+      </div>
+    </div>
+  </div>
+}
+
+function ProtectedRoute({ children, roles }: { children: React.ReactNode; roles?: string[] }) {
+  const { user, loading } = useAuth()
+  if (loading) return <LoadingScreen/>
+  if (!user) return <Navigate to="/login" replace/>
+  if (roles && !roles.includes(user.role)) return <Navigate to="/app" replace/>
+  return <>{children}</>
+}
+
+function AppLayout({ children }: { children: React.ReactNode }) {
