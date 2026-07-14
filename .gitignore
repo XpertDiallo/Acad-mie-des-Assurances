@@ -1,0 +1,13 @@
+.env
+*.db
+*.sqlite
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+node_modules/
+dist/
+coverage/
+.DS_Store
+*.log
+backend/tests/test_academie.db
