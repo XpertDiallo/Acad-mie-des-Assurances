@@ -1,0 +1,142 @@
+    user = db.get(User, cert.user_id); module = db.get(CourseModule, cert.module_id)
+    return {
+        "valid": not cert.revoked,
+        "status": "valide" if not cert.revoked else "révoquée",
+        "number": cert.number,
+        "holder": f"{user.first_name} {user.last_name}" if user else "Bénéficiaire",
+        "module_title": module.title if module else "Module",
+        "score": cert.score,
+        "issued_at": cert.issued_at,
+    }
+
+
+@app.get(f"{API_PREFIX}/admin/stats")
+def admin_stats(admin: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    del admin
+    return {
+        "users": db.scalar(select(func.count(User.id))) or 0,
+        "active_users": db.scalar(select(func.count(User.id)).where(User.active.is_(True))) or 0,
+        "students": db.scalar(select(func.count(User.id)).where(User.role == "student")) or 0,
+        "modules": db.scalar(select(func.count(CourseModule.id))) or 0,
+        "certificates": db.scalar(select(func.count(Certificate.id)).where(Certificate.revoked.is_(False))) or 0,
+        "pending_payments": db.scalar(select(func.count(Payment.id)).where(Payment.status == "pending")) or 0,
+        "chat_questions": db.scalar(select(func.count(ChatLog.id))) or 0,
+    }
+
+
+@app.get(f"{API_PREFIX}/admin/users")
+def admin_users(admin: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    del admin
+    users = list(db.scalars(select(User).order_by(User.created_at.desc())))
+    modules = {m.id: m for m in db.scalars(select(CourseModule))}
+    result = []
+    for user in users:
+        enrollments = list(db.scalars(select(Enrollment).where(Enrollment.user_id == user.id)))
+        result.append({
+            **UserOut.model_validate(user).model_dump(),
+            "access": [{"module_slug": modules[e.module_id].slug, "module_title": modules[e.module_id].title, "expires_at": e.expires_at, "source": e.source} for e in enrollments if e.module_id in modules],
+        })
+    return result
+
+
+@app.patch(f"{API_PREFIX}/admin/users/{{user_id}}/status")
+def set_user_status(user_id: int, active: bool = Query(...), admin: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    if target.id == admin.id and not active:
+        raise HTTPException(status_code=400, detail="Vous ne pouvez pas désactiver votre propre compte")
+    target.active = active
+    audit(db, admin.id, "user.status", f"user:{target.id}", {"active": active})
+    db.commit()
+    return {"updated": True, "active": target.active}
+
+
+@app.post(f"{API_PREFIX}/admin/access")
+def grant_access(payload: AccessGrantIn, admin: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    target = db.get(User, payload.user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    if payload.module_slug:
+        modules = [db.scalar(select(CourseModule).where(CourseModule.slug == payload.module_slug))]
+        if not modules[0]:
+            raise HTTPException(status_code=404, detail="Module introuvable")
+    else:
+        modules = list(db.scalars(select(CourseModule).where(CourseModule.is_free.is_(False))))
+    days = payload.days or (30 if payload.plan == "monthly" else 365 if payload.plan == "annual" else 365)
+    expiry = datetime.now(timezone.utc) + timedelta(days=days) if payload.plan in {"monthly", "annual"} else None
+    for module in modules:
+        row = db.scalar(select(Enrollment).where(Enrollment.user_id == target.id, Enrollment.module_id == module.id))
+        if not row:
+            row = Enrollment(user_id=target.id, module_id=module.id, source=payload.plan, granted_by=admin.id)
+            db.add(row)
+        row.source = payload.plan
+        row.granted_by = admin.id
+        row.expires_at = expiry
+    if payload.payment_reference:
+        payment = Payment(
+            user_id=target.id, module_id=modules[0].id if len(modules) == 1 else None, plan=payload.plan,
+            amount=payload.amount or (5000 if payload.plan == "module" else 30000 if payload.plan == "monthly" else 250000),
+            reference=payload.payment_reference, status="validated", validated_by=admin.id,
+        )
+        db.add(payment)
+    audit(db, admin.id, "access.grant", f"user:{target.id}", {"modules": [m.slug for m in modules], "plan": payload.plan})
+    db.commit()
+    return {"granted": True, "modules": [m.slug for m in modules], "expires_at": expiry}
+
+
+@app.delete(f"{API_PREFIX}/admin/access/{{user_id}}/{{module_slug}}")
+def revoke_access(user_id: int, module_slug: str, admin: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    module = db.scalar(select(CourseModule).where(CourseModule.slug == module_slug))
+    if not module:
+        raise HTTPException(status_code=404, detail="Module introuvable")
+    row = db.scalar(select(Enrollment).where(Enrollment.user_id == user_id, Enrollment.module_id == module.id))
+    if row:
+        db.delete(row)
+        audit(db, admin.id, "access.revoke", f"user:{user_id}", {"module": module_slug})
+        db.commit()
+    return {"revoked": True}
+
+
+@app.get(f"{API_PREFIX}/admin/payments")
+def list_payments(admin: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    del admin
+    rows = list(db.scalars(select(Payment).order_by(Payment.created_at.desc())))
+    return [{"id": p.id, "user_id": p.user_id, "module_id": p.module_id, "plan": p.plan, "amount": p.amount, "reference": p.reference, "status": p.status, "created_at": p.created_at} for p in rows]
+
+
+@app.get(f"{API_PREFIX}/pedagogy/overview")
+def pedagogy_overview(pedagogy: User = Depends(require_roles("admin", "pedagogy")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    del pedagogy
+    modules = list(db.scalars(select(CourseModule).order_by(CourseModule.id)))
+    return {
+        "modules": [
+            {**serialize_module(db, m, None, include_lessons=False), "questions": sum(len(l.questions) for l in m.lessons), "characters": sum(len(l.content) for l in m.lessons)}
+            for m in modules
+        ],
+        "recent_questions": db.scalar(select(func.count(ChatLog.id))) or 0,
+        "exam_attempts": db.scalar(select(func.count(ExamAttempt.id))) or 0,
+    }
+
+
+@app.patch(f"{API_PREFIX}/pedagogy/modules/{{slug}}")
+def update_module(slug: str, payload: ModuleUpdateIn, pedagogy: User = Depends(require_roles("admin", "pedagogy")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    module = db.scalar(select(CourseModule).where(CourseModule.slug == slug))
+    if not module:
+        raise HTTPException(status_code=404, detail="Module introuvable")
+    for field, value in payload.model_dump(exclude_none=True).items():
+        setattr(module, field, value)
+    module.version += 1
+    audit(db, pedagogy.id, "module.update", f"module:{slug}", payload.model_dump(exclude_none=True))
+    db.commit(); course_index.cache.pop(module.id, None)
+    return serialize_module(db, module, pedagogy, include_lessons=True)
+
+
+@app.patch(f"{API_PREFIX}/pedagogy/lessons/{{lesson_id}}")
+def update_lesson(lesson_id: str, payload: LessonUpdateIn, pedagogy: User = Depends(require_roles("admin", "pedagogy")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    lesson = db.get(Lesson, lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Leçon introuvable")
+    for field, value in payload.model_dump(exclude_none=True).items():
+        setattr(lesson, field, value)
+    module = db.get(CourseModule, lesson.module_id); module.version += 1
