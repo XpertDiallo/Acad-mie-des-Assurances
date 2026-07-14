@@ -1,0 +1,49 @@
+    audit(db, pedagogy.id, "lesson.update", f"lesson:{lesson_id}", payload.model_dump(exclude_none=True))
+    db.commit(); course_index.cache.pop(module.id, None)
+    return {"updated": True, "lesson_id": lesson.id, "version": module.version}
+
+
+@app.get(f"{API_PREFIX}/pedagogy/questions")
+def pedagogy_questions(
+    module_slug: str | None = None,
+    pedagogy: User = Depends(require_roles("admin", "pedagogy")),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    del pedagogy
+    stmt = select(Question, Lesson, CourseModule).join(Lesson, Question.lesson_id == Lesson.id).join(CourseModule, Lesson.module_id == CourseModule.id)
+    if module_slug:
+        stmt = stmt.where(CourseModule.slug == module_slug)
+    rows = db.execute(stmt.order_by(CourseModule.id, Lesson.order, Question.id)).all()
+    return [{"id": q.id, "module_slug": m.slug, "lesson_id": l.id, "lesson_title": l.title, "prompt": q.prompt, "options": json.loads(q.options_json), "correct_index": q.correct_index, "explanation": q.explanation, "difficulty": q.difficulty, "active": q.active} for q, l, m in rows]
+
+
+@app.post(f"{API_PREFIX}/pedagogy/questions", status_code=201)
+def create_question(payload: QuestionIn, pedagogy: User = Depends(require_roles("admin", "pedagogy")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    lesson = db.get(Lesson, payload.lesson_id)
+    if not lesson:
+        raise HTTPException(status_code=404, detail="Leçon introuvable")
+    qid = f"{lesson.id}-q-{secrets.token_hex(4)}"
+    question = Question(id=qid, lesson_id=lesson.id, prompt=payload.prompt, options_json=json.dumps(payload.options, ensure_ascii=False), correct_index=payload.correct_index, explanation=payload.explanation, difficulty=payload.difficulty, active=True)
+    db.add(question); audit(db, pedagogy.id, "question.create", f"question:{qid}"); db.commit()
+    return {"created": True, "id": qid}
+
+
+@app.patch(f"{API_PREFIX}/pedagogy/questions/{{question_id}}")
+def update_question(question_id: str, payload: QuestionUpdateIn, pedagogy: User = Depends(require_roles("admin", "pedagogy")), db: Session = Depends(get_db)) -> dict[str, Any]:
+    q = db.get(Question, question_id)
+    if not q:
+        raise HTTPException(status_code=404, detail="Question introuvable")
+    data = payload.model_dump(exclude_none=True)
+    if "options" in data:
+        q.options_json = json.dumps(data.pop("options"), ensure_ascii=False)
+    for field, value in data.items():
+        setattr(q, field, value)
+    audit(db, pedagogy.id, "question.update", f"question:{question_id}", data); db.commit()
+    return {"updated": True}
+
+
+@app.get(f"{API_PREFIX}/audit")
+def audit_logs(user: User = Depends(require_roles("admin")), db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    del user
+    rows = list(db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(100)))
+    return [{"id": row.id, "actor_id": row.actor_id, "action": row.action, "target": row.target, "details": json.loads(row.details_json), "created_at": row.created_at} for row in rows]
