@@ -1,0 +1,219 @@
+class Certificate(Base):
+    __tablename__ = "certificates"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[int] = mapped_column(ForeignKey("modules.id", ondelete="CASCADE"), index=True)
+    number: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    verification_code: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    score: Mapped[float] = mapped_column(Float)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[int | None] = mapped_column(ForeignKey("modules.id"), nullable=True)
+    plan: Mapped[str] = mapped_column(String(30), default="module")
+    amount: Mapped[int] = mapped_column(Integer)
+    reference: Mapped[str] = mapped_column(String(100), unique=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    validated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class ChatLog(Base):
+    __tablename__ = "chat_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    module_id: Mapped[int] = mapped_column(ForeignKey("modules.id", ondelete="CASCADE"), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    action: Mapped[str] = mapped_column(String(100))
+    target: Mapped[str] = mapped_column(String(200))
+    details_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    first_name: str
+    last_name: str
+    email: EmailStr
+    phone: str | None = None
+    country: str | None = None
+    profession: str | None = None
+    role: str
+    active: bool
+    created_at: datetime
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+
+
+class RegisterIn(BaseModel):
+    first_name: str = Field(min_length=2, max_length=80)
+    last_name: str = Field(min_length=2, max_length=80)
+    email: EmailStr
+    phone: str | None = None
+    country: str | None = None
+    profession: str | None = None
+    password: str = Field(min_length=8, max_length=100)
+
+
+class ProgressIn(BaseModel):
+    segment_index: int = 0
+    segment_count: int = 1
+    completed: bool = False
+
+
+class QuizSubmission(BaseModel):
+    lesson_id: str
+    answers: dict[str, int]
+
+
+class ExamSubmission(BaseModel):
+    answers: dict[str, int]
+
+
+class TutorIn(BaseModel):
+    module_slug: str
+    lesson_id: str | None = None
+    question: str = Field(min_length=2, max_length=1500)
+    mode: str = "clarification"
+
+
+class AccessGrantIn(BaseModel):
+    user_id: int
+    module_slug: str | None = None
+    plan: str = "module"
+    days: int | None = None
+    payment_reference: str | None = None
+    amount: int | None = None
+
+
+class ModuleUpdateIn(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    published: bool | None = None
+    price_fcfa: int | None = None
+
+
+class LessonUpdateIn(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    content: str | None = None
+    estimated_minutes: int | None = None
+
+
+class QuestionIn(BaseModel):
+    lesson_id: str
+    prompt: str
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+    explanation: str
+    difficulty: str = "fondamental"
+
+
+class QuestionUpdateIn(BaseModel):
+    prompt: str | None = None
+    options: list[str] | None = Field(default=None, min_length=4, max_length=4)
+    correct_index: int | None = Field(default=None, ge=0, le=3)
+    explanation: str | None = None
+    difficulty: str | None = None
+    active: bool | None = None
+
+
+def get_db() -> Iterable[Session]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode(), hashed.encode())
+    except ValueError:
+        return False
+
+
+def create_access_token(user: User) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {"sub": str(user.id), "role": user.role, "iat": now, "exp": now + timedelta(minutes=TOKEN_MINUTES)}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def bearer_token(authorization: str | None) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    return authorization.split(" ", 1)[1].strip()
+
+
+def get_current_user(authorization: str | None = None, db: Session = Depends(get_db)) -> User:
+    # FastAPI does not inject a plain header without Header(). Kept as a helper for tests; overridden below.
+    raise RuntimeError("Use current_user dependency")
+
+
+from fastapi import Header  # imported here to keep the public section compact
+
+
+def current_user(authorization: str | None = Header(default=None), db: Session = Depends(get_db)) -> User:
+    token = bearer_token(authorization)
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = int(payload["sub"])
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Session invalide ou expirée") from exc
+    user = db.get(User, user_id)
+    if not user or not user.active:
+        raise HTTPException(status_code=403, detail="Compte inactif")
+    return user
+
+
+def require_roles(*roles: str):
+    def dependency(user: User = Depends(current_user)) -> User:
+        if user.role not in roles:
+            raise HTTPException(status_code=403, detail="Accès non autorisé")
+        return user
+    return dependency
+
+
+def audit(db: Session, actor_id: int | None, action: str, target: str, details: dict[str, Any] | None = None) -> None:
+    db.add(AuditLog(actor_id=actor_id, action=action, target=target, details_json=json.dumps(details or {}, ensure_ascii=False)))
+
+
+def has_module_access(db: Session, user: User, module: CourseModule) -> bool:
+    if user.role in {"admin", "pedagogy"}:
+        return True
+    if module.is_free:
+        return True
+    enrollment = db.scalar(select(Enrollment).where(Enrollment.user_id == user.id, Enrollment.module_id == module.id))
+    if not enrollment:
+        return False
+    if enrollment.expires_at is None:
+        return True
+    expiry = enrollment.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry > datetime.now(timezone.utc)
+
+
+def module_progress(db: Session, user_id: int, module: CourseModule) -> dict[str, Any]:
+    lesson_ids = [lesson.id for lesson in module.lessons]
