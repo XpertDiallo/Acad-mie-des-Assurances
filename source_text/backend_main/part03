@@ -1,0 +1,155 @@
+                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+                        "temperature": 0.2,
+                        "max_tokens": 900,
+                    },
+                )
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"].strip()
+            if response.status_code not in {400, 404, 429, 503}:
+                break
+        except (httpx.HTTPError, KeyError, IndexError, TypeError):
+            continue
+    return None
+
+
+def local_answer(question: str, mode: str, sources: list[dict[str, Any]]) -> str:
+    lead = {
+        "simple": "Voici l’idée essentielle, en termes simples :",
+        "example": "Voici une explication accompagnée d’un exemple d’application :",
+        "numeric": "Voici les éléments du cours utiles pour construire un exemple chiffré :",
+        "trap": "Voici les points à ne pas confondre :",
+        "summary": "Voici le rappel des notions déjà étudiées :",
+    }.get(mode, "Voici l’explication tirée du cours :")
+    excerpts = []
+    for i, source in enumerate(sources[:3], 1):
+        text = source["chunk"].replace("\n", " ").strip()
+        if len(text) > 520:
+            text = text[:517].rsplit(" ", 1)[0] + "..."
+        excerpts.append(f"{i}. {text}")
+    return f"{lead}\n\n" + "\n\n".join(excerpts) + "\n\nSources du cours : " + ", ".join(f"{s['lesson_title']}" for s in sources[:3])
+
+
+def seed_database() -> None:
+    Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        if db.scalar(select(func.count(User.id))) == 0:
+            users = [
+                User(first_name="Webmaster", last_name="Administrateur", email="admin@academie-assurances.demo", password_hash=hash_password("Admin@2026!"), role="admin", active=True, country="Côte d’Ivoire"),
+                User(first_name="Responsable", last_name="Pédagogique", email="pedagogie@academie-assurances.demo", password_hash=hash_password("Pedago@2026!"), role="pedagogy", active=True, country="Côte d’Ivoire"),
+                User(first_name="Auditeur", last_name="Démonstration", email="auditeur@academie-assurances.demo", password_hash=hash_password("Etudiant@2026!"), role="student", active=True, country="Côte d’Ivoire", profession="Professionnel de l’assurance"),
+            ]
+            db.add_all(users)
+            db.flush()
+        if db.scalar(select(func.count(CourseModule.id))) == 0:
+            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            for item in data:
+                module = CourseModule(
+                    slug=item["slug"], code=item["code"], title=item["title"], description=item["description"],
+                    is_free=item["is_free"], price_fcfa=item["price_fcfa"], duration_label=item["duration_label"],
+                    level=item["level"], published=item["published"], version=1,
+                )
+                db.add(module)
+                db.flush()
+                for lesson_data in item["lessons"]:
+                    lesson = Lesson(
+                        id=lesson_data["id"], module_id=module.id, order=lesson_data["order"], title=lesson_data["title"],
+                        raw_title=lesson_data["raw_title"], summary=lesson_data["summary"], content=lesson_data["content"],
+                        estimated_minutes=lesson_data["estimated_minutes"],
+                    )
+                    db.add(lesson)
+                    for q in lesson_data["questions"]:
+                        db.add(Question(
+                            id=q["id"], lesson_id=lesson.id, prompt=q["prompt"], options_json=json.dumps(q["options"], ensure_ascii=False),
+                            correct_index=q["correct_index"], explanation=q["explanation"], difficulty=q["difficulty"], active=True,
+                        ))
+            db.flush()
+        # Explicitly grant all modules to admin and pedagogy demo accounts. Student keeps only the free module.
+        privileged = list(db.scalars(select(User).where(User.role.in_(["admin", "pedagogy"]))))
+        modules = list(db.scalars(select(CourseModule)))
+        for user in privileged:
+            for module in modules:
+                existing = db.scalar(select(Enrollment).where(Enrollment.user_id == user.id, Enrollment.module_id == module.id))
+                if not existing:
+                    db.add(Enrollment(user_id=user.id, module_id=module.id, source="role"))
+        db.commit()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    seed_database()
+    yield
+
+
+app = FastAPI(title=APP_NAME, version="1.0.0", docs_url="/api/docs", redoc_url="/api/redoc", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:4173").split(",") if origin.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get(f"{API_PREFIX}/health")
+def health(db: Session = Depends(get_db)) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "database": bool(db.scalar(select(func.count(User.id))) is not None),
+        "tutor_enhanced": bool(GROQ_API_KEY),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post(f"{API_PREFIX}/auth/login")
+def login(payload: LoginIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+    user = db.scalar(select(User).where(func.lower(User.email) == payload.email.lower()))
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect")
+    if not user.active:
+        raise HTTPException(status_code=403, detail="Compte désactivé. Contactez l’administrateur.")
+    audit(db, user.id, "auth.login", f"user:{user.id}")
+    db.commit()
+    return {"access_token": create_access_token(user), "token_type": "bearer", "user": UserOut.model_validate(user)}
+
+
+@app.post(f"{API_PREFIX}/auth/register", status_code=201)
+def register(payload: RegisterIn, db: Session = Depends(get_db)) -> dict[str, Any]:
+    if db.scalar(select(User).where(func.lower(User.email) == payload.email.lower())):
+        raise HTTPException(status_code=409, detail="Cette adresse email est déjà utilisée")
+    user = User(
+        first_name=payload.first_name.strip(), last_name=payload.last_name.strip(), email=payload.email.lower(),
+        phone=payload.phone, country=payload.country, profession=payload.profession,
+        password_hash=hash_password(payload.password), role="student", active=True,
+    )
+    db.add(user)
+    db.flush()
+    audit(db, user.id, "auth.register", f"user:{user.id}")
+    db.commit()
+    return {"access_token": create_access_token(user), "token_type": "bearer", "user": UserOut.model_validate(user)}
+
+
+@app.get(f"{API_PREFIX}/auth/me")
+def me(user: User = Depends(current_user)) -> UserOut:
+    return UserOut.model_validate(user)
+
+
+@app.get(f"{API_PREFIX}/modules")
+def list_modules(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    user = None
+    if authorization:
+        try:
+            token = bearer_token(authorization)
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+            user = db.get(User, int(payload["sub"]))
+        except Exception:
+            user = None
+    modules = list(db.scalars(select(CourseModule).where(CourseModule.published.is_(True)).order_by(CourseModule.id)))
+    return [serialize_module(db, module, user, include_lessons=False) for module in modules]
+
+
+@app.get(f"{API_PREFIX}/modules/{{slug}}")
