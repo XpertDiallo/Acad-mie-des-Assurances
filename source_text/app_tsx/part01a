@@ -1,0 +1,45 @@
+          <article><span className="plan-label">Annuel professionnel</span><h3>250 000 <small>FCFA</small></h3><p>Accès complet pendant une année pour un apprentissage approfondi.</p><ul><li><Check/> Tous les modules</li><li><Check/> Suivi de progression</li><li><Check/> Accès prioritaire</li></ul></article>
+        </div>
+        <p className="pricing-note">Le paiement est effectué hors de la plateforme. L’accès est activé après validation par l’administrateur.</p>
+      </section>
+    </main>
+    <footer><div className="brand"><span className="brand-mark">AA</span><span>Académie des Assurances</span></div><p>La formation professionnelle en assurance, simplement.</p></footer>
+  </div>
+}
+
+function ModuleCard({ module, publicMode = false, index = 0 }: { module: ModuleSummary; publicMode?: boolean; index?: number }) {
+  const theme = moduleThemes[module.slug] || { icon: '📘', accent: 'mint' }
+  return <article className={`module-card accent-${theme.accent}`}>
+    <div className="module-card-top"><span className="module-number">{String(index + 1).padStart(2, '0')}</span><span className="module-icon">{theme.icon}</span></div>
+    <div className="module-badges">{module.is_free ? <span className="badge badge-free">Gratuit</span> : <span className="badge">{formatFcfa(module.price_fcfa)}</span>}<span className="badge badge-soft">{module.duration_label}</span></div>
+    <h3>{module.title}</h3><p>{module.description}</p>
+    {!publicMode && module.progress && <ProgressBar value={module.progress.percent} label={`${module.progress.completed}/${module.progress.total} leçons`}/>} 
+    <div className="module-footer"><span><BookOpen size={16}/> {module.lesson_count} leçons</span>
+      {publicMode ? <Link to="/register" className="round-link"><ChevronRight/></Link> : module.has_access ? <Link to={`/app/modules/${module.slug}`} className="round-link"><ChevronRight/></Link> : <span className="round-link locked"><Lock/></span>}
+    </div>
+  </article>
+}
+
+function AuthPage({ mode }: { mode: 'login' | 'register' }) {
+  const auth = useAuth(); const navigate = useNavigate()
+  const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
+  const [form, setForm] = useState<Record<string, string>>({ email: '', password: '', first_name: '', last_name: '', phone: '', country: 'Côte d’Ivoire', profession: '' })
+  const demos = [
+    { label: 'Administrateur', email: 'admin@academie-assurances.demo', password: 'Admin@2026!', icon: <ShieldCheck/> },
+    { label: 'Responsable pédagogique', email: 'pedagogie@academie-assurances.demo', password: 'Pedago@2026!', icon: <BookOpen/> },
+    { label: 'Auditeur étudiant', email: 'auditeur@academie-assurances.demo', password: 'Etudiant@2026!', icon: <GraduationCap/> },
+  ]
+  async function submit(e: FormEvent) {
+    e.preventDefault(); setBusy(true); setError('')
+    try {
+      if (mode === 'login') await auth.login(form.email, form.password)
+      else await auth.register(form)
+      navigate('/app')
+    } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
+  }
+  async function demo(email: string, password: string) {
+    setBusy(true); setError('')
+    try { await auth.login(email, password); navigate('/app') } catch (e) { setError((e as Error).message) } finally { setBusy(false) }
+  }
+  return <div className="auth-shell">
+    <div className="auth-art">
