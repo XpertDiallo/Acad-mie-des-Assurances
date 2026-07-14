@@ -1,0 +1,10 @@
+  const { user, logout } = useAuth(); const location = useLocation(); const [open, setOpen] = useState(false)
+  if (!user) return null
+  const studentLinks = [
+    {to:'/app', label:'Tableau de bord', icon:<LayoutDashboard/>}, {to:'/app/modules', label:'Mes formations', icon:<Library/>}, {to:'/app/certificates', label:'Mes attestations', icon:<Award/>}
+  ]
+  const adminLinks = [{to:'/app', label:'Vue générale', icon:<BarChart3/>},{to:'/app/admin/users',label:'Utilisateurs et accès',icon:<Users/>},{to:'/app/admin/audit',label:'Journal d’activité',icon:<ShieldCheck/>}]
+  const pedagogyLinks = [{to:'/app',label:'Vue pédagogique',icon:<BarChart3/>},{to:'/app/pedagogy/modules',label:'Modules et contenus',icon:<BookOpen/>},{to:'/app/pedagogy/questions',label:'Banque de QCM',icon:<ClipboardCheck/>}]
+  const links = user.role === 'admin' ? adminLinks : user.role === 'pedagogy' ? pedagogyLinks : studentLinks
+  return <div className="app-shell">
+    <aside className={`sidebar ${open ? 'open' : ''}`}>
