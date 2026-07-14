@@ -1,0 +1,132 @@
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Award, BarChart3, BookOpen, Check, ChevronLeft, ChevronRight, CircleDollarSign,
+  ClipboardCheck, Clock3, GraduationCap, Headphones, Home, KeyRound, LayoutDashboard,
+  Library, Lock, LogOut, Menu, MessageCircleQuestion, Mic, Pause, Play, Plus, RefreshCw,
+  Save, Search, Settings, ShieldCheck, Sparkles, Square, Users, Volume2, X
+} from 'lucide-react'
+import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { api, formatFcfa, ModuleSummary, User } from './api'
+import { useAuth } from './auth'
+
+type LessonSummary = {
+  id: string
+  order: number
+  title: string
+  summary: string
+  estimated_minutes: number
+  progress?: { segment_index: number; segment_count: number; completed: boolean; quiz_score?: number | null } | null
+}
+
+type ModuleDetail = ModuleSummary & { lessons: LessonSummary[] }
+type LessonDetail = {
+  id: string
+  module_slug: string
+  module_title: string
+  order: number
+  title: string
+  summary: string
+  content: string
+  estimated_minutes: number
+  progress?: { segment_index: number; segment_count: number; completed: boolean; quiz_score?: number | null } | null
+}
+
+type QuizQuestion = { id: string; prompt: string; options: string[]; difficulty: string }
+type TutorMessage = { role: 'student' | 'tutor'; text: string; sources?: { lesson_title: string; excerpt: string }[] }
+
+const roleLabels: Record<string, string> = {
+  admin: 'Webmaster Administrateur', pedagogy: 'Responsable Pédagogique', student: 'Auditeur étudiant'
+}
+
+const moduleThemes: Record<string, { icon: string; accent: string }> = {
+  fondements: { icon: '🛡️', accent: 'mint' },
+  contrat: { icon: '📝', accent: 'gold' },
+  vie: { icon: '🌱', accent: 'coral' },
+  automobile: { icon: '🚘', accent: 'sky' },
+}
+
+function useAsync<T>(loader: () => Promise<T>, deps: unknown[]) {
+  const [data, setData] = useState<T | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError('')
+    loader().then(value => active && setData(value)).catch(e => active && setError(e.message)).finally(() => active && setLoading(false))
+    return () => { active = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
+  return { data, loading, error, reload: () => loader().then(setData) }
+}
+
+function LoadingScreen() {
+  return <div className="center-screen"><div className="spinner"/><p>Chargement de votre espace...</p></div>
+}
+
+function ErrorBox({ message }: { message: string }) {
+  return message ? <div className="alert alert-error">{message}</div> : null
+}
+
+function ProgressBar({ value, label }: { value: number; label?: string }) {
+  return <div className="progress-wrap">
+    <div className="progress-track"><div className="progress-fill" style={{ width: `${Math.max(0, Math.min(100, value))}%` }}/></div>
+    {label && <span>{label}</span>}
+  </div>
+}
+
+function PublicHeader() {
+  const { user } = useAuth()
+  return <header className="public-header">
+    <Link to="/" className="brand"><span className="brand-mark">AA</span><span>Académie des Assurances</span></Link>
+    <nav><a href="#modules">Modules</a><a href="#tarifs">Tarifs</a><a href="#methode">Méthode</a></nav>
+    <Link className="btn btn-primary btn-small" to={user ? '/app' : '/login'}>{user ? 'Mon espace' : 'Se connecter'}</Link>
+  </header>
+}
+
+function LandingPage() {
+  const { data: modules } = useAsync(() => api<ModuleSummary[]>('/api/modules'), [])
+  return <div className="public-page">
+    <PublicHeader />
+    <main>
+      <section className="hero">
+        <div className="hero-copy">
+          <span className="eyebrow">Formation professionnelle en assurance</span>
+          <h1>Apprenez comme en classe,<br/><em>à votre rythme.</em></h1>
+          <p>Des cours structurés, lus à voix haute, expliqués pas à pas, enrichis d’exemples pratiques et d’évaluations corrigées.</p>
+          <div className="hero-actions"><Link className="btn btn-primary" to="/register">Commencer gratuitement</Link><Link className="btn btn-ghost" to="/login">Tester les accès démo</Link></div>
+          <div className="trust-row"><span><Check size={17}/> Module 1 gratuit</span><span><Check size={17}/> Reprise automatique</span><span><Check size={17}/> Attestation vérifiable</span></div>
+        </div>
+        <div className="hero-visual">
+          <div className="player-mock">
+            <div className="mock-top"><span className="pill">Leçon en cours</span><span>62%</span></div>
+            <h3>Les éléments de l’opération d’assurance</h3>
+            <p>Le risque est l’événement dommageable, futur et incertain contre lequel une personne cherche à se protéger...</p>
+            <div className="wave"><i/><i/><i/><i/><i/><i/><i/><i/><i/></div>
+            <div className="mock-controls"><button><ChevronLeft/></button><button className="play"><Play fill="currentColor"/></button><button><ChevronRight/></button></div>
+            <div className="coach-card"><MessageCircleQuestion/><div><strong>Besoin d’une explication ?</strong><span>Posez votre question par écrit ou à voix haute.</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="methode" className="section light-section">
+        <div className="section-title"><span className="eyebrow">Une expérience active</span><h2>Un véritable accompagnement pédagogique</h2></div>
+        <div className="feature-grid">
+          <article><div className="feature-icon"><Headphones/></div><h3>Lecture guidée</h3><p>Le texte s’affiche par séquences et peut être lu avec la voix et la vitesse de votre choix.</p></article>
+          <article><div className="feature-icon"><MessageCircleQuestion/></div><h3>Explications à la demande</h3><p>Arrêtez la séance, demandez un exemple, une clarification ou les pièges à éviter, puis reprenez exactement où vous étiez.</p></article>
+          <article><div className="feature-icon"><ClipboardCheck/></div><h3>Évaluation progressive</h3><p>QCM corrigés, examen final noté et retour détaillé sur chaque réponse.</p></article>
+          <article><div className="feature-icon"><Award/></div><h3>Attestation vérifiable</h3><p>À partir de 70/100, recevez une attestation numérotée et vérifiable par code QR.</p></article>
+        </div>
+      </section>
+
+      <section id="modules" className="section">
+        <div className="section-title"><span className="eyebrow">Catalogue du MVP</span><h2>Quatre modules pour construire des bases solides</h2></div>
+        <div className="module-grid public-modules">
+          {(modules || []).map((module, index) => <ModuleCard key={module.slug} module={module} publicMode index={index}/>) }
+        </div>
+      </section>
+
+      <section id="tarifs" className="section pricing-section">
+        <div className="section-title"><span className="eyebrow">Des formules simples</span><h2>Choisissez votre rythme d’apprentissage</h2></div>
+        <div className="pricing-grid">
+          <article><span className="plan-label">Par module</span><h3>5 000 <small>FCFA</small></h3><p>Accès au module sélectionné, évaluations et attestation.</p><ul><li><Check/> Accès longue durée</li><li><Check/> Tuteur du cours</li><li><Check/> Examen final</li></ul></article>
+          <article className="featured-plan"><span className="popular">Le plus flexible</span><span className="plan-label">Mensuel</span><h3>30 000 <small>FCFA</small></h3><p>Accès à tous les modules pendant 30 jours.</p><ul><li><Check/> Catalogue complet</li><li><Check/> Toutes les évaluations</li><li><Check/> Attestations incluses</li></ul></article>
