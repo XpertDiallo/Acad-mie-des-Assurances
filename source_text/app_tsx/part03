@@ -1,0 +1,65 @@
+function LockedModule({ module }: { module: ModuleSummary }) {
+  return <div className="locked-page"><div className="lock-visual"><Lock/></div><span className="eyebrow">Accès à activer</span><h1>{module.title}</h1><p>{module.description}</p><div className="price-big">{formatFcfa(module.price_fcfa)} <small>par module</small></div><div className="payment-steps"><span><b>1</b> Effectuez le paiement hors plateforme</span><span><b>2</b> Transmettez la référence au gestionnaire</span><span><b>3</b> Votre accès est activé</span></div><Link className="btn btn-primary" to="/app/modules">Retour au catalogue</Link></div>
+}
+
+function splitSegments(text: string, max = 720) {
+  const paragraphs = text.split(/\n+/).map(x=>x.trim()).filter(Boolean)
+  const result: string[]=[]; let current=''
+  for (const paragraph of paragraphs) {
+    if (current && current.length+paragraph.length+2>max) { result.push(current); current=paragraph }
+    else current = `${current}\n\n${paragraph}`.trim()
+  }
+  if(current) result.push(current)
+  return result.length?result:['Aucun contenu disponible.']
+}
+
+declare global {
+  interface Window { SpeechRecognition?: new () => SpeechRecognitionLike; webkitSpeechRecognition?: new () => SpeechRecognitionLike }
+}
+type SpeechRecognitionLike = { lang:string; interimResults:boolean; continuous:boolean; start:()=>void; stop:()=>void; onresult:((event:any)=>void)|null; onerror:((event:any)=>void)|null; onend:(()=>void)|null }
+
+function LessonPlayer() {
+  const { lessonId, slug }=useParams(); const { token }=useAuth(); const navigate=useNavigate()
+  const { data: lesson, loading, error }=useAsync(()=>api<LessonDetail>(`/api/lessons/${lessonId}`,{},token),[lessonId,token])
+  const { data: module }=useAsync(()=>api<ModuleDetail>(`/api/modules/${slug}`,{},token),[slug,token])
+  const segments=useMemo(()=>splitSegments(lesson?.content||''),[lesson?.content])
+  const [index,setIndex]=useState(0); const [speaking,setSpeaking]=useState(false); const [rate,setRate]=useState(1); const [gender,setGender]=useState<'female'|'male'>('female'); const [auto,setAuto]=useState(true)
+  const [showQuiz,setShowQuiz]=useState(false); const [showCoach,setShowCoach]=useState(true)
+  const initialized=useRef(false)
+  useEffect(()=>{if(lesson && !initialized.current){setIndex(Math.min(lesson.progress?.segment_index||0,segments.length-1));initialized.current=true}},[lesson,segments.length])
+  useEffect(()=>{if(!lesson||!initialized.current)return; const timer=setTimeout(()=>api(`/api/progress/${lesson.id}`,{method:'PUT',body:JSON.stringify({segment_index:index,segment_count:segments.length,completed:index===segments.length-1})},token).catch(()=>{}),400);return()=>clearTimeout(timer)},[index,lesson,segments.length,token])
+  useEffect(()=>()=>window.speechSynthesis?.cancel(),[])
+  const chooseVoice=useCallback(()=>{
+    const voices=window.speechSynthesis?.getVoices().filter(v=>v.lang.toLowerCase().startsWith('fr'))||[]
+    const female=/audrey|amélie|amelie|hortense|julie|marie|céline|celine|virginie|léa|lea|female/i
+    const male=/thomas|paul|henri|daniel|nicolas|male/i
+    return voices.find(v=>(gender==='female'?female:male).test(v.name)) || voices[gender==='female'?0:1] || voices[0]
+  },[gender])
+  const speak=useCallback((target=index)=>{
+    if(!('speechSynthesis'in window))return
+    window.speechSynthesis.cancel(); const utter=new SpeechSynthesisUtterance(segments[target]); utter.lang='fr-FR';utter.rate=rate; const voice=chooseVoice();if(voice)utter.voice=voice
+    utter.onstart=()=>setSpeaking(true);utter.onend=()=>{setSpeaking(false);if(auto&&target<segments.length-1)setIndex(target+1)};utter.onerror=()=>setSpeaking(false);window.speechSynthesis.speak(utter)
+  },[index,segments,rate,chooseVoice,auto])
+  function stop(){window.speechSynthesis?.cancel();setSpeaking(false)}
+  function move(delta:number){stop();setIndex(i=>Math.max(0,Math.min(segments.length-1,i+delta)))}
+  if(loading)return<LoadingScreen/>; if(!lesson)return<ErrorBox message={error}/>
+  const currentLessonIndex=module?.lessons.findIndex(l=>l.id===lesson.id)??0; const nextLesson=module?.lessons[currentLessonIndex+1]; const prevLesson=module?.lessons[currentLessonIndex-1]
+  return <div className="player-page">
+    <div className="player-top"><button className="back-link" onClick={()=>navigate(`/app/modules/${slug}`)}><ChevronLeft/> Quitter la leçon</button><div className="player-title"><span>{lesson.module_title}</span><strong>{lesson.title}</strong></div><button className="icon-btn" onClick={()=>setShowCoach(!showCoach)}><MessageCircleQuestion/></button></div>
+    <div className={`player-grid ${showCoach?'with-coach':''}`}>
+      <aside className="lesson-outline"><h3>Programme</h3>{module?.lessons.map((l,i)=><Link className={l.id===lesson.id?'active':''} to={`/app/modules/${slug}/lesson/${l.id}`} key={l.id}><span>{l.progress?.completed?<Check/>:i+1}</span><small>{l.title}</small></Link>)}</aside>
+      <section className="reading-panel">
+        {lesson.progress && lesson.progress.segment_index>0 && <div className="resume-banner"><RefreshCw/><div><strong>Vous reprenez une séance commencée.</strong><span>Vous étiez à la séquence {lesson.progress.segment_index+1} sur {segments.length}.</span></div><button onClick={()=>setShowCoach(true)} className="btn btn-small btn-ghost">Voir un résumé</button></div>}
+        <div className="reading-head"><div><span className="eyebrow">Séquence {index+1} sur {segments.length}</span><h1>{lesson.title}</h1></div><span className="reading-percent">{Math.round(((index+1)/segments.length)*100)}%</span></div>
+        <ProgressBar value={((index+1)/segments.length)*100}/>
+        <article className={`reading-card ${speaking?'is-speaking':''}`}>{segments[index].split('\n').map((p,i)=><p key={i}>{p}</p>)}</article>
+        <div className="audio-bar">
+          <button className="round-control" disabled={index===0} onClick={()=>move(-1)}><ChevronLeft/></button>
+          <button className="main-play" onClick={()=>speaking?stop():speak()}>{speaking?<Pause fill="currentColor"/>:<Play fill="currentColor"/>}</button>
+          <button className="round-control" disabled={index===segments.length-1} onClick={()=>move(1)}><ChevronRight/></button>
+          <div className="audio-option"><label>Voix</label><select value={gender} onChange={e=>setGender(e.target.value as 'female'|'male')}><option value="female">Femme</option><option value="male">Homme</option></select></div>
+          <div className="audio-option"><label>Vitesse</label><select value={rate} onChange={e=>setRate(Number(e.target.value))}><option value="0.85">Lente</option><option value="1">Normale</option><option value="1.25">Soutenue</option><option value="1.5">Rapide</option></select></div>
+          <label className="auto-check"><input type="checkbox" checked={auto} onChange={e=>setAuto(e.target.checked)}/> Lecture continue</label>
+        </div>
+        <div className="reading-actions"><button className="btn btn-ghost" onClick={()=>{stop();setShowCoach(true)}}><MessageCircleQuestion/> Demander une explication</button>{index===segments.length-1?<button className="btn btn-primary" onClick={()=>setShowQuiz(true)}>Faire le QCM <ClipboardCheck/></button>:<button className="btn btn-primary" onClick={()=>move(1)}>Séquence suivante <ChevronRight/></button>}</div>
+        <div className="lesson-navigation">{prevLesson?<Link to={`/app/modules/${slug}/lesson/${prevLesson.id}`}><ChevronLeft/><span><small>Précédente</small>{prevLesson.title}</span></Link>:<span/>}{nextLesson?<Link to={`/app/modules/${slug}/lesson/${nextLesson.id}`}><span><small>Suivante</small>{nextLesson.title}</span><ChevronRight/></Link>:<Link to={`/app/modules/${slug}/exam`}><span><small>Terminer</small>Examen final</span><ClipboardCheck/></Link>}</div>
