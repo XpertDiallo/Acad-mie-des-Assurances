@@ -1,0 +1,41 @@
+name: Publication initiale du code source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - source_bundle/READY
+
+permissions:
+  contents: write
+
+jobs:
+  publish-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstituer et contrôler l’archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat source_bundle/part* | base64 --decode > /tmp/academie-source.zip
+          echo "f1d586210a1c25762f9499cc984646d382a2f73b9c31b2a55d7d716bce79dd6d  /tmp/academie-source.zip" | sha256sum --check --strict
+          mkdir -p /tmp/academie-source
+          unzip -q -o /tmp/academie-source.zip -d /tmp/academie-source
+
+      - name: Publier les fichiers du MVP
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a /tmp/academie-source/. ./
+          rm -rf source_bundle
+          rm -f .github/workflows/bootstrap-source.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publier le MVP complet de l’Académie des Assurances"
+          git push origin main
