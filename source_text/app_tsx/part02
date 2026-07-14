@@ -1,0 +1,71 @@
+      <div className="sidebar-head"><Link to="/app" className="brand brand-light"><span className="brand-mark">AA</span><span>Académie<br/>des Assurances</span></Link><button className="icon-btn mobile-close" onClick={()=>setOpen(false)}><X/></button></div>
+      <nav className="side-nav">{links.map(link => <Link onClick={()=>setOpen(false)} className={location.pathname===link.to || (link.to!='/app' && location.pathname.startsWith(link.to)) ? 'active':''} to={link.to} key={link.to}>{link.icon}<span>{link.label}</span></Link>)}</nav>
+      {user.role === 'student' && <div className="sidebar-tip"><Sparkles/><strong>Conseil du jour</strong><p>Une session de 20 minutes régulière vaut mieux qu’une longue session occasionnelle.</p></div>}
+      <div className="sidebar-user"><div className="avatar">{user.first_name[0]}{user.last_name[0]}</div><div><strong>{user.first_name} {user.last_name}</strong><span>{roleLabels[user.role]}</span></div><button className="icon-btn" title="Déconnexion" onClick={logout}><LogOut/></button></div>
+    </aside>
+    <div className="app-main">
+      <header className="app-topbar"><button className="icon-btn menu-btn" onClick={()=>setOpen(true)}><Menu/></button><div className="topbar-search"><Search/><span>Rechercher dans vos cours</span></div><div className="topbar-right"><span className="role-chip">{roleLabels[user.role]}</span><div className="avatar small">{user.first_name[0]}{user.last_name[0]}</div></div></header>
+      <main className="workspace">{children}</main>
+    </div>
+  </div>
+}
+
+function DashboardRouter() {
+  const { user } = useAuth()
+  if (!user) return null
+  return user.role === 'admin' ? <AdminDashboard/> : user.role === 'pedagogy' ? <PedagogyDashboard/> : <StudentDashboard/>
+}
+
+function StudentDashboard() {
+  const { token, user } = useAuth()
+  const { data: modules, loading, error } = useAsync(() => api<ModuleSummary[]>('/api/modules',{},token), [token])
+  if (loading) return <LoadingScreen/>
+  const current = modules?.find(m => m.progress && m.progress.percent > 0 && m.progress.percent < 100) || modules?.find(m=>m.has_access)
+  const completed = modules?.reduce((s,m)=>s+(m.progress?.completed||0),0)||0
+  const total = modules?.reduce((s,m)=>s+(m.has_access?m.lesson_count:0),0)||0
+  return <>
+    <div className="page-head"><div><span className="eyebrow">Bonjour {user?.first_name}</span><h1>Votre parcours d’apprentissage</h1><p>Reprenez votre formation ou explorez un nouveau module.</p></div><Link className="btn btn-primary" to={current ? `/app/modules/${current.slug}` : '/app/modules'}><Play size={18}/> Continuer</Link></div>
+    <ErrorBox message={error}/>
+    <div className="stat-grid">
+      <StatCard icon={<BookOpen/>} value={`${completed}/${total}`} label="Leçons terminées" tone="navy"/>
+      <StatCard icon={<Clock3/>} value={`${Math.round(completed*0.6)} h`} label="Temps estimé étudié" tone="green"/>
+      <StatCard icon={<ClipboardCheck/>} value="70/100" label="Seuil de réussite" tone="gold"/>
+      <StatCard icon={<Award/>} value="0" label="Attestations obtenues" tone="coral"/>
+    </div>
+    {current && <section className="continue-card">
+      <div className="continue-copy"><span className="eyebrow light">Reprendre votre formation</span><h2>{current.title}</h2><p>{current.description}</p><ProgressBar value={current.progress?.percent || 0} label={`${current.progress?.percent || 0}% terminé`}/><Link className="btn btn-light" to={`/app/modules/${current.slug}`}>Poursuivre le module <ChevronRight/></Link></div>
+      <div className="continue-illustration"><div className="big-icon">{moduleThemes[current.slug]?.icon}</div><div className="orbit one"/><div className="orbit two"/></div>
+    </section>}
+    <div className="section-row"><div><h2>Vos modules</h2><p>Accédez aux contenus activés et suivez votre progression.</p></div><Link to="/app/modules">Voir tout <ChevronRight size={17}/></Link></div>
+    <div className="module-grid">{(modules||[]).map((m,i)=><ModuleCard key={m.slug} module={m} index={i}/>)}</div>
+  </>
+}
+
+function StatCard({ icon, value, label, tone }: { icon: React.ReactNode; value: string | number; label: string; tone: string }) {
+  return <article className={`stat-card tone-${tone}`}><div className="stat-icon">{icon}</div><div><strong>{value}</strong><span>{label}</span></div></article>
+}
+
+function ModulesPage() {
+  const { token } = useAuth(); const { data, loading, error } = useAsync(()=>api<ModuleSummary[]>('/api/modules',{},token),[token])
+  return <><div className="page-head"><div><span className="eyebrow">Catalogue</span><h1>Mes formations</h1><p>Le module 1 est gratuit. Les autres deviennent accessibles après validation du paiement.</p></div></div><ErrorBox message={error}/>{loading?<LoadingScreen/>:<div className="module-grid wide">{(data||[]).map((m,i)=><ModuleCard module={m} index={i} key={m.slug}/>)}</div>}</>
+}
+
+function CourseOverview() {
+  const { slug } = useParams(); const { token } = useAuth(); const navigate=useNavigate()
+  const { data: module, loading, error } = useAsync(()=>api<ModuleDetail>(`/api/modules/${slug}`,{},token),[slug,token])
+  if (loading) return <LoadingScreen/>
+  if (!module) return <ErrorBox message={error || 'Module introuvable'}/>
+  if (!module.has_access) return <LockedModule module={module}/>
+  const nextLesson = module.lessons.find(l=>!l.progress?.completed) || module.lessons[0]
+  return <>
+    <button className="back-link" onClick={()=>navigate(-1)}><ChevronLeft/> Retour aux modules</button>
+    <section className={`course-hero accent-${moduleThemes[module.slug]?.accent || 'mint'}`}>
+      <div><div className="module-badges"><span className="badge badge-soft">{module.duration_label}</span><span className="badge badge-soft">{module.level}</span></div><h1>{module.title}</h1><p>{module.description}</p><div className="course-meta"><span><BookOpen/> {module.lesson_count} leçons</span><span><ClipboardCheck/> QCM et examen final</span><span><Award/> Attestation dès 70/100</span></div><Link className="btn btn-primary" to={`/app/modules/${module.slug}/lesson/${nextLesson.id}`}><Play/> {module.progress?.percent ? 'Reprendre la formation':'Commencer la formation'}</Link></div><div className="course-big-icon">{moduleThemes[module.slug]?.icon}</div>
+    </section>
+    <div className="course-layout"><section><div className="section-row"><div><h2>Programme du module</h2><p>Avancez dans l’ordre ou reprenez une leçon déjà consultée.</p></div><span className="completion-circle">{module.progress?.percent || 0}%</span></div>
+      <div className="lesson-list">{module.lessons.map((lesson,index)=><Link to={`/app/modules/${module.slug}/lesson/${lesson.id}`} className={`lesson-row ${lesson.progress?.completed?'done':''}`} key={lesson.id}><span className="lesson-index">{lesson.progress?.completed?<Check/>:index+1}</span><div><strong>{lesson.title}</strong><p>{lesson.summary}</p><span><Clock3/> {lesson.estimated_minutes} min</span></div><ChevronRight/></Link>)}</div>
+      <Link className="exam-callout" to={`/app/modules/${module.slug}/exam`}><div><ClipboardCheck/><span><strong>Examen final du module</strong><small>10 questions • 30 minutes • seuil 70/100</small></span></div><ChevronRight/></Link>
+    </section><aside className="course-side"><div className="side-card"><h3>Votre progression</h3><div className="large-progress"><strong>{module.progress?.percent || 0}%</strong><span>du module terminé</span></div><ProgressBar value={module.progress?.percent || 0}/><p>{module.progress?.completed || 0} leçons terminées sur {module.lesson_count}</p></div><div className="side-card support"><MessageCircleQuestion/><h3>Votre tuteur de cours</h3><p>Dans chaque leçon, demandez une explication simple, un exemple ou les pièges à éviter.</p></div></aside></div>
+  </>
+}
+
